@@ -1,289 +1,254 @@
 """
-蝦皮標題批次改寫 — 核心改寫邏輯
-同步自 keyword-rewriter五家店.html（2026-04-13）
+蝦皮標題批次改寫 — Streamlit 介面
+員工上傳蝦皮匯出的 Excel → 選擇要生成的店版本 → 一鍵改寫 → 下載結果
 """
 
-import os
-import re
-import random
-from openai import OpenAI
-from config import (
-    GIFT_MALE, GIFT_FEMALE, GIFT_NEUTRAL, CAT_GIFT,
-    MALE_SIGNALS, FEMALE_SIGNALS, SHOPEE_RULE, MOMO_RULE,
-    CAT_SIGNALS, CAT_KW_HINTS, ALL_GIFT_WORDS
-)
+import streamlit as st
+import time
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from io import BytesIO
+from rewriter import rewrite_title
 
-# 取得 API Key：優先用 Streamlit Cloud secrets，其次用 .env
-def _get_api_key():
-    try:
-        import streamlit as st
-        return st.secrets.get('QWEN_API_KEY')
-    except Exception:
-        pass
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except Exception:
-        pass
-    return os.getenv('QWEN_API_KEY')
+st.set_page_config(page_title='蝦皮關鍵字批次改寫', layout='wide')
 
-client = OpenAI(
-    api_key=_get_api_key(),
-    base_url='https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
-)
+# ── 密碼驗證 ──
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title('🔒 請輸入密碼')
+    pwd = st.text_input('密碼', type='password')
+    if st.button('登入'):
+        if pwd == st.secrets.get('APP_PASSWORD', 'mary8888'):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error('密碼錯誤')
+    st.stop()
+
+st.title('🔄 蝦皮關鍵字批次改寫工具')
 
 
-def detect_gender(text: str) -> str:
-    """偵測商品性別屬性"""
-    t = text.lower()
-    m = sum(1 for w in MALE_SIGNALS if w in t)
-    f = sum(1 for w in FEMALE_SIGNALS if w in t)
-    if m > f:
-        return 'male'
-    if f > m:
-        return 'female'
-    return 'neutral'
+# ── Excel 讀取（用 XML 直接解析，避免 openpyxl 相容性問題） ──
+
+def read_shopee_excel(file_bytes: bytes) -> list:
+    """讀取蝦皮匯出的 Excel"""
+    bio = BytesIO(file_bytes)
+    z = zipfile.ZipFile(bio)
+    ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+
+    ss_tree = ET.parse(z.open('xl/sharedStrings.xml'))
+    strings = []
+    for si in ss_tree.findall(f'{ns}si'):
+        text = ''.join(t.text or '' for t in si.iter(f'{ns}t'))
+        strings.append(text)
+
+    tree = ET.parse(z.open('xl/worksheets/sheet1.xml'))
+    root = tree.getroot()
+
+    products = []
+    for row in root.findall(f'.//{ns}row'):
+        r_num = int(row.get('r'))
+        if r_num < 7:
+            continue
+
+        cells = {}
+        for cell in row.findall(f'{ns}c'):
+            ref = cell.get('r')
+            col_letter = ''.join(c for c in ref if c.isalpha())
+            t = cell.get('t')
+            v_el = cell.find(f'{ns}v')
+            v = v_el.text if v_el is not None else None
+            if t == 's' and v is not None:
+                val = strings[int(v)]
+            else:
+                val = v
+            cells[col_letter] = val
+
+        title = cells.get('C')
+        if title:
+            products.append({
+                'row_num': r_num,
+                'product_id': cells.get('A', ''),
+                'sku': cells.get('B', ''),
+                'title': title,
+            })
+
+    return products
 
 
-def detect_category(text: str) -> str:
-    """偵測商品品類"""
-    t = text.lower()
-    best, best_score = '通用', 0
-    for cat, signals in CAT_SIGNALS.items():
-        score = sum(1 for w in signals if w.lower() in t)
-        if score > best_score:
-            best_score = score
-            best = cat
-    return best
+# ── Excel 寫入（保留原始格式，只改 C 欄內容） ──
+
+def build_output_excel(original_bytes: bytes, products: list) -> bytes:
+    """複製原始 Excel，在共用字串表新增新標題，只改 C 欄的索引值，格式完全保留"""
+    bio_in = BytesIO(original_bytes)
+    z_in = zipfile.ZipFile(bio_in, 'r')
+    ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+
+    title_map = {p['row_num']: p['new_title'] for p in products if 'new_title' in p}
+
+    # ── 1. 解析 sharedStrings.xml，把新標題加到尾巴 ──
+    ss_tree = ET.parse(z_in.open('xl/sharedStrings.xml'))
+    ss_root = ss_tree.getroot()
+
+    # 計算目前有幾個共用字串
+    existing_count = len(ss_root.findall(f'{{{ns}}}si'))
+
+    # 建立 row_num → 新的共用字串索引 的對照表
+    new_index_map = {}
+    for row_num, new_title in title_map.items():
+        idx = existing_count + len(new_index_map)
+        new_index_map[row_num] = idx
+        # 新增 <si><t>新標題</t></si>
+        si_el = ET.SubElement(ss_root, f'{{{ns}}}si')
+        t_el = ET.SubElement(si_el, f'{{{ns}}}t')
+        t_el.text = new_title
+
+    # 更新 count 和 uniqueCount 屬性
+    total = existing_count + len(new_index_map)
+    ss_root.set('count', str(total))
+    ss_root.set('uniqueCount', str(total))
+
+    # ── 2. 解析 sheet1.xml，只改 C 欄 cell 的 <v> 值 ──
+    sheet_tree = ET.parse(z_in.open('xl/worksheets/sheet1.xml'))
+    sheet_root = sheet_tree.getroot()
+
+    for row in sheet_root.findall(f'.//{{{ns}}}row'):
+        r_num = int(row.get('r'))
+        if r_num not in new_index_map:
+            continue
+
+        for cell in row.findall(f'{{{ns}}}c'):
+            ref = cell.get('r')
+            if ref and ref.startswith('C'):
+                # 保持 t="s"（共用字串類型），只改索引值
+                v_el = cell.find(f'{{{ns}}}v')
+                if v_el is not None:
+                    v_el.text = str(new_index_map[r_num])
+                break
+
+    # ── 3. 重新打包 Excel（只替換 sheet1.xml 和 sharedStrings.xml） ──
+    bio_out = BytesIO()
+    with zipfile.ZipFile(bio_out, 'w', zipfile.ZIP_DEFLATED) as z_out:
+        for item in z_in.namelist():
+            if item == 'xl/worksheets/sheet1.xml':
+                z_out.writestr(item, ET.tostring(sheet_root, xml_declaration=True, encoding='UTF-8'))
+            elif item == 'xl/sharedStrings.xml':
+                z_out.writestr(item, ET.tostring(ss_root, xml_declaration=True, encoding='UTF-8'))
+            else:
+                z_out.writestr(item, z_in.read(item))
+
+    z_in.close()
+    return bio_out.getvalue()
 
 
-def get_gift_pool(text: str, platform: str = 'shopee') -> list:
-    """根據品類和性別取得送禮詞池"""
-    gender = detect_gender(text)
-    cat = detect_category(text)
+# ── 介面 ──
 
-    if cat in CAT_GIFT:
-        cat_pool = CAT_GIFT[cat]
-        # 有些品類用 shopee/momo 分（如宗教開運）
-        if isinstance(cat_pool, dict):
-            if platform in cat_pool:
-                plat_data = cat_pool[platform]
-                if isinstance(plat_data, list):
-                    return plat_data
-                if isinstance(plat_data, dict):
-                    return plat_data.get(gender, plat_data.get('neutral', []))
-            # 直接用性別分
-            if gender in cat_pool:
-                return cat_pool[gender]
-            if 'neutral' in cat_pool:
-                return cat_pool['neutral']
-        elif isinstance(cat_pool, list):
-            return cat_pool
+uploaded = st.file_uploader('上傳蝦皮匯出的 Excel 檔案', type=['xlsx'])
 
-    # 預設：通用性別池
-    if gender == 'male':
-        return GIFT_MALE
-    elif gender == 'female':
-        return GIFT_FEMALE
-    return GIFT_NEUTRAL
+if uploaded:
+    file_bytes = uploaded.read()
 
+    if 'products' not in st.session_state or st.session_state.get('uploaded_name') != uploaded.name:
+        st.session_state.products = read_shopee_excel(file_bytes)
+        st.session_state.uploaded_name = uploaded.name
+        st.session_state.file_bytes = file_bytes
+        st.session_state.results = {}
 
-def pick_gifts(text: str, used: list = None, platform: str = 'shopee') -> list:
-    """隨機挑選 1~2 個送禮關鍵字"""
-    n = 1 if random.random() < 0.5 else 2
-    pool = get_gift_pool(text, platform)
+    products = st.session_state.products
+    st.success(f'找到 {len(products)} 個商品')
 
-    if used:
-        avail = [g for g in pool if g not in used]
-        if len(avail) < n:
-            avail = pool
-    else:
-        avail = pool
+    with st.expander('📋 商品列表（點擊展開）', expanded=False):
+        for i, p in enumerate(products):
+            st.text(f'{i+1}. [{p["sku"]}] {p["title"]}')
 
-    return random.sample(avail, min(n, len(avail)))
+    st.divider()
 
+    st.subheader('選擇要生成的店版本')
+    col1, col2, col3, col4 = st.columns(4)
+    store_b = col1.checkbox('B店', value=True)
+    store_c = col2.checkbox('C店', value=False)
+    store_d = col3.checkbox('D店', value=False)
+    store_e = col4.checkbox('E店', value=False)
 
-def get_cat_hint(cat: str) -> str:
-    """取得品類搜尋維度提示"""
-    if cat in CAT_KW_HINTS:
-        hints = CAT_KW_HINTS[cat]
-        lines = [f"  {k}：{v}" for k, v in hints.items()]
-        return '\n\n【品類搜尋維度參考（替換次要詞時從這些維度選）】\n' + '\n'.join(lines)
-    return ''
+    selected_stores = []
+    if store_b: selected_stores.append('B')
+    if store_c: selected_stores.append('C')
+    if store_d: selected_stores.append('D')
+    if store_e: selected_stores.append('E')
 
+    platform = st.radio('平台', ['shopee', 'momo'], horizontal=True)
 
-def rev6(text: str) -> str:
-    """前 6 個詞反轉順序，增加差異化"""
-    tokens = text.strip().split()
-    if len(tokens) <= 1:
-        return text
-    n = min(6, len(tokens))
-    return ' '.join(tokens[:n][::-1] + tokens[n:])
+    st.divider()
 
+    if st.button('🚀 開始批次改寫', type='primary', disabled=len(selected_stores) == 0):
+        total = len(products) * len(selected_stores)
+        progress = st.progress(0, text='準備中...')
+        status = st.empty()
+        done_count = 0
 
-def clean_ai_result(text: str, trailing_code: str = '') -> str:
-    """清理 AI 回傳結果"""
-    res = text.strip()
-    res = re.sub(r'^[「『"\']+|[」』"\']+$', '', res)
-    if trailing_code:
-        res = re.sub(r'\b' + re.escape(trailing_code) + r'\b', '', res)
-        res = re.sub(r'\s{2,}', ' ', res).strip()
-        res = re.sub(r'\s+\d{2,5}\s*$', '', res).strip()
-    return res
+        results = {}
 
+        for store in selected_stores:
+            store_label = f'{store}店'
+            status.info(f'正在改寫 {store_label}...')
 
-def trim_to_limit(text: str, limit: int) -> str:
-    """強制裁剪到字數上限，保護送禮詞不被砍"""
-    if len(text) <= limit:
-        return text
-    tokens = text.split()
-    # 先從尾巴砍非送禮詞
-    for i in range(len(tokens) - 1, 0, -1):
-        if len(' '.join(tokens)) <= limit:
-            break
-        if tokens[i] not in ALL_GIFT_WORDS:
-            tokens.pop(i)
-    # 如果還超過，只好砍送禮詞
-    while len(tokens) > 1 and len(' '.join(tokens)) > limit:
-        tokens.pop()
-    return ' '.join(tokens)
+            history = []
+            store_products = []
 
+            for idx, product in enumerate(products):
+                title = product['title']
+                progress.progress(
+                    done_count / total,
+                    text=f'{store_label} - {idx+1}/{len(products)}：{title[:30]}...'
+                )
 
-def ensure_gifts(text: str, gift: list) -> str:
-    """確保結果剛好有 1~2 個送禮詞（不多不少）"""
-    tokens = text.split()
-    existing = [w for w in tokens if w in ALL_GIFT_WORDS]
-    no_gift = [w for w in tokens if w not in ALL_GIFT_WORDS]
-    # 合併 pickGift 選的 + AI 自己生的，取前 2 個不重複
-    candidates = list(gift) + existing
-    final = []
-    seen = set()
-    for g in candidates:
-        if g not in seen and len(final) < 2:
-            seen.add(g)
-            final.append(g)
-    return ' '.join(no_gift + final)
+                try:
+                    new_title = rewrite_title(title, store_label, history, platform=platform)
+                    p_copy = dict(product)
+                    p_copy['new_title'] = new_title
+                    store_products.append(p_copy)
+                    history.append({'store': store_label, 'text': new_title})
+                except Exception as e:
+                    p_copy = dict(product)
+                    p_copy['new_title'] = title
+                    p_copy['error'] = str(e)
+                    store_products.append(p_copy)
 
+                done_count += 1
+                time.sleep(0.3)
 
-def split_trailing_code(title: str) -> tuple:
-    """抽取標題尾巴的型號數字"""
-    m = re.match(r'^(.*?)\s+(\d{2,5})\s*$', title)
-    if m:
-        return m.group(1).strip(), m.group(2)
-    return title.strip(), ''
+            results[store_label] = store_products
 
+        progress.progress(1.0, text='全部完成！')
+        status.success('✅ 全部改寫完成！')
+        st.session_state.results = results
 
-def build_rewrite_prompt(original_title: str, store_label: str,
-                         history: list = None, platform: str = 'shopee',
-                         trailing_code: str = '') -> dict:
-    """
-    建構改寫 prompt，回傳 {prompt, gift}
-    """
-    gift = pick_gifts(original_title, platform=platform)
-    gender = detect_gender(original_title)
+    if st.session_state.results:
+        st.divider()
+        st.subheader('📥 改寫結果')
 
-    if gender == 'male':
-        gender_hint = '（男性商品：請用父親節禮物、送爸爸、送男友等，不要用母親節禮物）'
-    elif gender == 'female':
-        gender_hint = '（女性商品：請用母親節禮物、送媽媽、送女友等，不要用父親節禮物）'
-    else:
-        gender_hint = ''
+        for store_label, store_products in st.session_state.results.items():
+            with st.expander(f'{store_label} 結果', expanded=True):
+                for p in store_products:
+                    err = p.get('error', '')
+                    if err:
+                        st.error(f'❌ [{p["sku"]}] 失敗：{err}')
+                    else:
+                        st.markdown(f'**原始：** {p["title"]}')
+                        st.markdown(f'**{store_label}：** {p["new_title"]}')
+                        st.text('')
 
-    hist_text = ''
-    if history:
-        hist_lines = [f'版本{i+1}（{h["store"]}）：{h["text"]}' for i, h in enumerate(history)]
-        hist_text = '\n\n【去重：次要關鍵字必須替換，不可與以下版本重複】\n' + '\n'.join(hist_lines)
+                output_bytes = build_output_excel(st.session_state.file_bytes, store_products)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f'rewritten_{store_label}_{timestamp}.xlsx'
 
-    code_len = (len(trailing_code) + 1) if trailing_code else 0
-    cat = detect_category(original_title)
-    cat_hint = get_cat_hint(cat)
-    cat_rule = ''
-    if cat != '通用':
-        cat_rule = f'\n6. 【品類鎖定：{cat}】所有關鍵字必須屬於「{cat}」品類，嚴禁出現其他品類的詞'
-
-    code_note = ''
-    if trailing_code:
-        code_note = f'\n7. 【禁止】不要輸出尾巴的型號數字「{trailing_code}」，系統會自動補上'
-
-    if platform == 'momo':
-        plat_rule = MOMO_RULE
-        plat_label = 'MOMO（模糊匹配）'
-        char_limit = 50 - code_len
-    else:
-        plat_rule = SHOPEE_RULE
-        plat_label = '蝦皮（精確匹配）'
-        char_limit = 60 - code_len
-
-    kw_tokens = original_title.strip().split()
-    locked6 = kw_tokens[:min(6, len(kw_tokens))]
-    rest = kw_tokens[len(locked6):]
-    locked6_str = '、'.join(locked6)
-    rest_str = '、'.join(rest) if rest else '（無）'
-
-    prompt = f"""你是電商店群關鍵字專家。
-
-將「A店」關鍵字改寫成「{store_label}」的新版本。
-A店平台：{plat_label}
-{store_label}平台：{plat_label}
-
-{plat_rule}
-
-【多維度覆蓋策略】替換次要詞時，確保新詞覆蓋不同的搜尋維度（品項別名、材質、功能、對象、場合、風格），同一維度不重複。
-
-🔒【鎖定區（前6個詞）】以下 {len(locked6)} 個詞必須原封不動出現在輸出裡，一個字都不能改：
-{locked6_str}
-
-🔄【可替換區（第7個詞以後）】只有以下詞可以被替換成同品類、不同維度的新詞：
-{rest_str}
-
-改寫規則：
-1. 【鎖定區不動】上面列出的 {len(locked6)} 個鎖定詞必須全部保留，不可替換、修改、合併或拆開（系統會自動調換順序來製造差異）
-2. 【品類不動】替換的詞必須跟原始標題屬於同一個商品品類，嚴禁出現其他品類的詞（例：手機繩不可出現包包詞，項鍊不可出現手錶詞）
-3. 【結構不動】保持與 A 店相同的排列結構：主品項詞在前，屬性詞在中間，送禮詞分散在後半段
-4. 只替換可替換區的部分次要關鍵字，換成「同品類、不同維度」的詞（例：把材質詞換成風格詞，把場合詞換成對象詞）
-5. 【字數要求】總字數（含空格）必須接近 {char_limit} 字（允許 ±2 字），不可太短也不可超過
-6. 只輸出關鍵字，詞間空格，不加說明{cat_rule}{code_note}{cat_hint}{hist_text}
-
-【A店（{len(original_title)}字）】
-{original_title}
-
-⚠️ 最後提醒：輸出裡【必須】包含以下送禮詞（原封不動放進去，不可省略、不可替換）：{'、'.join(gift)}{gender_hint}
-
-請直接輸出{store_label}關鍵字（目標 {char_limit} 字）："""
-
-    return {'prompt': prompt, 'gift': gift}
-
-
-def rewrite_title(original_title: str, store_label: str, history: list = None,
-                   platform: str = 'shopee') -> str:
-    """呼叫 Qwen API 改寫一個標題"""
-    keywords, code = split_trailing_code(original_title)
-
-    result = build_rewrite_prompt(keywords, store_label, history,
-                                   platform=platform, trailing_code=code)
-    prompt = result['prompt']
-    gift = result['gift']
-
-    response = client.chat.completions.create(
-        model='qwen-plus',
-        max_tokens=500,
-        messages=[{'role': 'user', 'content': prompt}]
-    )
-
-    raw = response.choices[0].message.content.strip()
-    res = clean_ai_result(raw, code)
-
-    # 確保剛好 1~2 個送禮詞
-    res = ensure_gifts(res, gift)
-
-    # 強制裁剪（送禮詞受保護）
-    if platform == 'momo':
-        kw_limit = 50
-    else:
-        kw_limit = 60 - (len(code) + 1 if code else 0)
-    res = trim_to_limit(res, kw_limit)
-    res = rev6(res)
-
-    if code:
-        res = res + ' ' + code
-    return res
+                st.download_button(
+                    label=f'⬇️ 下載 {store_label} Excel',
+                    data=output_bytes,
+                    file_name=filename,
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    key=f'dl_{store_label}'
+                )
