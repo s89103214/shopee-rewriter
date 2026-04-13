@@ -128,9 +128,9 @@ if uploaded:
     st.subheader('選擇要生成的店版本')
     col1, col2, col3, col4 = st.columns(4)
     store_b = col1.checkbox('B店', value=True)
-    store_c = col2.checkbox('C店', value=True)
-    store_d = col3.checkbox('D店', value=True)
-    store_e = col4.checkbox('E店', value=True)
+    store_c = col2.checkbox('C店', value=False)
+    store_d = col3.checkbox('D店', value=False)
+    store_e = col4.checkbox('E店', value=False)
 
     selected_stores = []
     if store_b: selected_stores.append('B')
