@@ -12,6 +12,22 @@ from io import BytesIO
 from rewriter import rewrite_title
 
 st.set_page_config(page_title='蝦皮關鍵字批次改寫', layout='wide')
+
+# ── 密碼驗證 ──
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title('🔒 請輸入密碼')
+    pwd = st.text_input('密碼', type='password')
+    if st.button('登入'):
+        if pwd == st.secrets.get('APP_PASSWORD', 'mary8888'):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error('密碼錯誤')
+    st.stop()
+
 st.title('🔄 蝦皮關鍵字批次改寫工具')
 
 
