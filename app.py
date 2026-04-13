@@ -36,7 +36,7 @@ st.title('🔄 蝦皮關鍵字批次改寫工具')
 def read_shopee_excel(file_bytes: bytes) -> list:
     """讀取蝦皮匯出的 Excel，回傳商品列表"""
     bio = BytesIO(file_bytes)
-    wb = openpyxl.load_workbook(bio, read_only=True)
+    wb = openpyxl.load_workbook(bio)
     ws = wb.active
 
     products = []
