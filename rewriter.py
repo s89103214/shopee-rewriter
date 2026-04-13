@@ -7,16 +7,28 @@ import os
 import re
 import random
 from openai import OpenAI
-from dotenv import load_dotenv
 from config import (
     GIFT_MALE, GIFT_FEMALE, GIFT_NEUTRAL, CAT_GIFT,
     MALE_SIGNALS, FEMALE_SIGNALS, SHOPEE_RULE, MOMO_RULE,
     CAT_SIGNALS, CAT_KW_HINTS, ALL_GIFT_WORDS
 )
 
-load_dotenv()
+# 取得 API Key：優先用 Streamlit Cloud secrets，其次用 .env
+def _get_api_key():
+    try:
+        import streamlit as st
+        return st.secrets.get('QWEN_API_KEY')
+    except Exception:
+        pass
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    return os.getenv('QWEN_API_KEY')
+
 client = OpenAI(
-    api_key=os.getenv('QWEN_API_KEY'),
+    api_key=_get_api_key(),
     base_url='https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
 )
 
