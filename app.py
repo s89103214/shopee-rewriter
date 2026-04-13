@@ -5,8 +5,9 @@
 
 import streamlit as st
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 import openpyxl
-from copy import copy
 from datetime import datetime
 from io import BytesIO
 from rewriter import rewrite_title
@@ -31,48 +32,75 @@ if not st.session_state.authenticated:
 st.title('🔄 蝦皮關鍵字批次改寫工具')
 
 
-# ── Excel 讀寫（用 openpyxl） ──
+# ── Excel 讀取（用 XML 直接解析，避免 openpyxl 相容性問題） ──
 
 def read_shopee_excel(file_bytes: bytes) -> list:
-    """讀取蝦皮匯出的 Excel，回傳商品列表"""
+    """讀取蝦皮匯出的 Excel"""
     bio = BytesIO(file_bytes)
-    wb = openpyxl.load_workbook(bio)
-    ws = wb.active
+    z = zipfile.ZipFile(bio)
+    ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+
+    ss_tree = ET.parse(z.open('xl/sharedStrings.xml'))
+    strings = []
+    for si in ss_tree.findall(f'{ns}si'):
+        text = ''.join(t.text or '' for t in si.iter(f'{ns}t'))
+        strings.append(text)
+
+    tree = ET.parse(z.open('xl/worksheets/sheet1.xml'))
+    root = tree.getroot()
 
     products = []
-    for row in ws.iter_rows(min_row=7, values_only=False):
-        r_num = row[0].row
-        product_id = str(row[0].value or '')
-        sku = str(row[1].value or '')
-        title = str(row[2].value or '')
+    for row in root.findall(f'.//{ns}row'):
+        r_num = int(row.get('r'))
+        if r_num < 7:
+            continue
 
-        if title and title != 'None':
+        cells = {}
+        for cell in row.findall(f'{ns}c'):
+            ref = cell.get('r')
+            col_letter = ''.join(c for c in ref if c.isalpha())
+            t = cell.get('t')
+            v_el = cell.find(f'{ns}v')
+            v = v_el.text if v_el is not None else None
+            if t == 's' and v is not None:
+                val = strings[int(v)]
+            else:
+                val = v
+            cells[col_letter] = val
+
+        title = cells.get('C')
+        if title:
             products.append({
                 'row_num': r_num,
-                'product_id': product_id,
-                'sku': sku,
+                'product_id': cells.get('A', ''),
+                'sku': cells.get('B', ''),
                 'title': title,
             })
 
-    wb.close()
     return products
 
 
-def build_output_excel(original_bytes: bytes, products: list) -> bytes:
-    """複製原始 Excel，把 C 欄標題替換成改寫後的版本，回傳 bytes"""
-    bio_in = BytesIO(original_bytes)
-    wb = openpyxl.load_workbook(bio_in)
+# ── Excel 寫入（新建簡單 Excel，蝦皮批量匯入格式） ──
+
+def build_output_excel(products: list) -> bytes:
+    """建立新 Excel，包含蝦皮需要的欄位"""
+    wb = openpyxl.Workbook()
     ws = wb.active
 
-    title_map = {p['row_num']: p['new_title'] for p in products if 'new_title' in p}
+    # 蝦皮批量匯入的標頭
+    ws.append(['商品ID', '主商品貨號', '商品名稱'])
 
-    for row_num, new_title in title_map.items():
-        ws.cell(row=row_num, column=3, value=new_title)
+    for p in products:
+        ws.append([
+            p.get('product_id', ''),
+            p.get('sku', ''),
+            p.get('new_title', p.get('title', ''))
+        ])
 
-    bio_out = BytesIO()
-    wb.save(bio_out)
+    bio = BytesIO()
+    wb.save(bio)
     wb.close()
-    return bio_out.getvalue()
+    return bio.getvalue()
 
 
 # ── 介面 ──
@@ -82,7 +110,6 @@ uploaded = st.file_uploader('上傳蝦皮匯出的 Excel 檔案', type=['xlsx'])
 if uploaded:
     file_bytes = uploaded.read()
 
-    # 初始化 session state
     if 'products' not in st.session_state or st.session_state.get('uploaded_name') != uploaded.name:
         st.session_state.products = read_shopee_excel(file_bytes)
         st.session_state.uploaded_name = uploaded.name
@@ -92,14 +119,12 @@ if uploaded:
     products = st.session_state.products
     st.success(f'找到 {len(products)} 個商品')
 
-    # 顯示商品列表
     with st.expander('📋 商品列表（點擊展開）', expanded=False):
         for i, p in enumerate(products):
             st.text(f'{i+1}. [{p["sku"]}] {p["title"]}')
 
     st.divider()
 
-    # 選擇要生成的店
     st.subheader('選擇要生成的店版本')
     col1, col2, col3, col4 = st.columns(4)
     store_b = col1.checkbox('B店', value=True)
@@ -117,7 +142,6 @@ if uploaded:
 
     st.divider()
 
-    # 開始改寫
     if st.button('🚀 開始批次改寫', type='primary', disabled=len(selected_stores) == 0):
         total = len(products) * len(selected_stores)
         progress = st.progress(0, text='準備中...')
@@ -161,7 +185,6 @@ if uploaded:
         status.success('✅ 全部改寫完成！')
         st.session_state.results = results
 
-    # 顯示結果 & 下載
     if st.session_state.results:
         st.divider()
         st.subheader('📥 改寫結果')
@@ -177,8 +200,7 @@ if uploaded:
                         st.markdown(f'**{store_label}：** {p["new_title"]}')
                         st.text('')
 
-                # 下載按鈕
-                output_bytes = build_output_excel(st.session_state.file_bytes, store_products)
+                output_bytes = build_output_excel(store_products)
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 filename = f'rewritten_{store_label}_{timestamp}.xlsx'
 
