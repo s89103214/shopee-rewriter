@@ -7,7 +7,6 @@ import streamlit as st
 import time
 import zipfile
 import xml.etree.ElementTree as ET
-import openpyxl
 from datetime import datetime
 from io import BytesIO
 from rewriter import rewrite_title
@@ -80,27 +79,69 @@ def read_shopee_excel(file_bytes: bytes) -> list:
     return products
 
 
-# ── Excel 寫入（新建簡單 Excel，蝦皮批量匯入格式） ──
+# ── Excel 寫入（保留原始格式，只改 C 欄內容） ──
 
-def build_output_excel(products: list) -> bytes:
-    """建立新 Excel，包含蝦皮需要的欄位"""
-    wb = openpyxl.Workbook()
-    ws = wb.active
+def build_output_excel(original_bytes: bytes, products: list) -> bytes:
+    """複製原始 Excel，在共用字串表新增新標題，只改 C 欄的索引值，格式完全保留"""
+    bio_in = BytesIO(original_bytes)
+    z_in = zipfile.ZipFile(bio_in, 'r')
+    ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 
-    # 蝦皮批量匯入的標頭
-    ws.append(['商品ID', '主商品貨號', '商品名稱'])
+    title_map = {p['row_num']: p['new_title'] for p in products if 'new_title' in p}
 
-    for p in products:
-        ws.append([
-            p.get('product_id', ''),
-            p.get('sku', ''),
-            p.get('new_title', p.get('title', ''))
-        ])
+    # ── 1. 解析 sharedStrings.xml，把新標題加到尾巴 ──
+    ss_tree = ET.parse(z_in.open('xl/sharedStrings.xml'))
+    ss_root = ss_tree.getroot()
 
-    bio = BytesIO()
-    wb.save(bio)
-    wb.close()
-    return bio.getvalue()
+    # 計算目前有幾個共用字串
+    existing_count = len(ss_root.findall(f'{{{ns}}}si'))
+
+    # 建立 row_num → 新的共用字串索引 的對照表
+    new_index_map = {}
+    for row_num, new_title in title_map.items():
+        idx = existing_count + len(new_index_map)
+        new_index_map[row_num] = idx
+        # 新增 <si><t>新標題</t></si>
+        si_el = ET.SubElement(ss_root, f'{{{ns}}}si')
+        t_el = ET.SubElement(si_el, f'{{{ns}}}t')
+        t_el.text = new_title
+
+    # 更新 count 和 uniqueCount 屬性
+    total = existing_count + len(new_index_map)
+    ss_root.set('count', str(total))
+    ss_root.set('uniqueCount', str(total))
+
+    # ── 2. 解析 sheet1.xml，只改 C 欄 cell 的 <v> 值 ──
+    sheet_tree = ET.parse(z_in.open('xl/worksheets/sheet1.xml'))
+    sheet_root = sheet_tree.getroot()
+
+    for row in sheet_root.findall(f'.//{{{ns}}}row'):
+        r_num = int(row.get('r'))
+        if r_num not in new_index_map:
+            continue
+
+        for cell in row.findall(f'{{{ns}}}c'):
+            ref = cell.get('r')
+            if ref and ref.startswith('C'):
+                # 保持 t="s"（共用字串類型），只改索引值
+                v_el = cell.find(f'{{{ns}}}v')
+                if v_el is not None:
+                    v_el.text = str(new_index_map[r_num])
+                break
+
+    # ── 3. 重新打包 Excel（只替換 sheet1.xml 和 sharedStrings.xml） ──
+    bio_out = BytesIO()
+    with zipfile.ZipFile(bio_out, 'w', zipfile.ZIP_DEFLATED) as z_out:
+        for item in z_in.namelist():
+            if item == 'xl/worksheets/sheet1.xml':
+                z_out.writestr(item, ET.tostring(sheet_root, xml_declaration=True, encoding='UTF-8'))
+            elif item == 'xl/sharedStrings.xml':
+                z_out.writestr(item, ET.tostring(ss_root, xml_declaration=True, encoding='UTF-8'))
+            else:
+                z_out.writestr(item, z_in.read(item))
+
+    z_in.close()
+    return bio_out.getvalue()
 
 
 # ── 介面 ──
@@ -200,7 +241,7 @@ if uploaded:
                         st.markdown(f'**{store_label}：** {p["new_title"]}')
                         st.text('')
 
-                output_bytes = build_output_excel(store_products)
+                output_bytes = build_output_excel(st.session_state.file_bytes, store_products)
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 filename = f'rewritten_{store_label}_{timestamp}.xlsx'
 
